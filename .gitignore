@@ -1,0 +1,13 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Claude Code 本地配置
+.claude/
+
+# Codex 本地配置
+.codex/
+
+# Git worktrees for isolated feature work
+.worktrees/

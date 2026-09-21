@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [
+        "gh-proxy.com",
+        "cdn.gh-proxy.org",
+        "gh.catmak.name",
+        "cdn.jsdelivr.net",
+        "testingcf.jsdelivr.net",
+        "wget.la",
+        "ghfast.top"
+      ],
+      "domain_suffix": [
+        "jsdelivr.net"
+      ]
+    }
+  ]
+}

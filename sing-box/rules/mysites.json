@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "domain": [
+        "www.zerotier.com"
+      ],
+      "domain_suffix": [
+        "tailscale.com",
+        "tailscale.io",
+        "dynv6.com",
+        "dynv6.net",
+        "trendmicro.com"
+      ]
+    }
+  ]
+}
