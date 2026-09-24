@@ -2,6 +2,9 @@
 .DS_Store
 Thumbs.db
 .vscode/
+.venv/
+__pycache__/
+*.py[cod]
 
 # Claude Code 本地配置
 .claude/
