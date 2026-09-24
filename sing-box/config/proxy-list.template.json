@@ -1,0 +1,16 @@
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "♻️ 自动选择",
+      "outbounds": [],
+      "interval": "10m0s",
+      "tolerance": 100
+    },
+    {
+      "type": "selector",
+      "tag": "🐸 手动选择",
+      "outbounds": []
+    }
+  ]
+}
