@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +20,31 @@ AUTO_TAG = "♻️ 自动选择"
 MANUAL_TAG = "🐸 手动选择"
 GROUP_TYPES = {AUTO_TAG: "urltest", MANUAL_TAG: "selector"}
 NON_NODE_TYPES = {"block", "direct", "dns", "loadbalance", "loopback", "reject", "selector", "urltest"}
+
+PROTOCOL_LABELS = {
+    "ss": "SS",
+    "ssr": "SSR",
+    "vmess": "VMess",
+    "vless": "VLESS",
+    "trojan": "Trojan",
+    "hysteria2": "Hysteria2",
+    "hy2": "Hysteria2",
+    "tuic": "TUIC",
+    "socks": "SOCKS",
+    "socks5": "SOCKS5",
+    "http": "HTTP",
+    "https": "HTTPS",
+}
+SUPPORTED_SUMMARY = "、".join(["SS", "SSR", "VMess", "VLESS", "Trojan", "Hysteria2", "TUIC", "SOCKS5", "HTTP"])
+
+TLS_MODES = {"", "none", "tls", "xtls", "reality"}
+VLESS_FLOWS = {"", "xtls-rprx-vision"}
+CONGESTION_CONTROLS = {"cubic", "new_reno", "bbr"}
+UDP_RELAY_MODES = {"native", "quic"}
+PACKET_ENCODINGS = {"", "packetaddr", "xudp"}
+TRANSPORT_ALIASES = {"": "tcp", "tcp": "tcp", "none": "tcp", "raw": "tcp"}
+SUBSCRIPTION_MIN_LENGTH = 32
+BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/=_-]+")
 
 
 class ConversionError(Exception):
@@ -33,6 +58,14 @@ def _decode_base64(value: str, line_number: int, field: str) -> bytes:
         return base64.b64decode(encoded, altchars=b"-_", validate=True)
     except (UnicodeEncodeError, binascii.Error, ValueError):
         raise ConversionError(f"第 {line_number} 行：{field} 不是有效的 Base64") from None
+
+
+def _decode_base64_text(value: str, line_number: int, field: str) -> str:
+    decoded = _decode_base64(value, line_number, field)
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConversionError(f"第 {line_number} 行：{field} 不是有效文本") from None
 
 
 def _integer(value: object, line_number: int, field: str, minimum: int, maximum: int | None = None) -> int:
@@ -93,46 +126,235 @@ def _boolean(value: object, line_number: int, field: str) -> bool:
     raise ConversionError(f"第 {line_number} 行：字段 {field} 必须是布尔值")
 
 
-def _parse_shadowsocks(uri: str, line_number: int) -> dict:
+def _query_params(parsed, line_number: int) -> dict[str, str]:
+    try:
+        return dict(parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False))
+    except ValueError:
+        raise ConversionError(f"第 {line_number} 行：URI 查询参数格式无效") from None
+
+
+def _query_value(params: dict[str, str], *names: str) -> str | None:
+    for name in names:
+        value = params.get(name)
+        if value:
+            return value
+    return None
+
+
+def _query_bool(params: dict[str, str], line_number: int, *names: str) -> bool:
+    value = _query_value(params, *names)
+    if value is None:
+        return False
+    return _boolean(value, line_number, names[0])
+
+
+def _split_link(uri: str, scheme: str, line_number: int):
+    label = PROTOCOL_LABELS[scheme]
     try:
         parsed = urlsplit(uri)
         host = parsed.hostname
         port = parsed.port
-        username = parsed.username
-        password_part = parsed.password
     except ValueError:
-        raise ConversionError(f"第 {line_number} 行：SS URI 的服务器地址或端口无效") from None
+        raise ConversionError(f"第 {line_number} 行：{label} URI 的服务器地址或端口无效") from None
+    if not host or port is None:
+        raise ConversionError(f"第 {line_number} 行：{label} URI 缺少服务器地址或端口")
+    return parsed, host, _port(port, line_number)
 
-    if parsed.scheme.lower() != "ss" or not host or port is None or username is None:
-        raise ConversionError(f"第 {line_number} 行：SS URI 缺少认证信息、服务器或端口")
-    if parsed.query:
-        raise ConversionError(f"第 {line_number} 行：不支持带查询参数的 SS URI")
 
-    if password_part is not None:
-        method = unquote(username)
-        secret = unquote(password_part)
+def _credentials(parsed, line_number: int, label: str) -> tuple[str, str | None]:
+    username = parsed.username
+    if not username:
+        raise ConversionError(f"第 {line_number} 行：{label} URI 缺少认证信息")
+    if parsed.password is None:
+        return unquote(username), None
+    password = unquote(parsed.password)
+    if not password:
+        raise ConversionError(f"第 {line_number} 行：{label} URI 的认证信息不完整")
+    return unquote(username), password
+
+
+def _build_tls(
+    params: dict[str, str],
+    line_number: int,
+    *,
+    required: bool = False,
+    implicit: bool = False,
+    default_alpn: list[str] | None = None,
+) -> dict | None:
+    raw_mode = params.get("security")
+    # 部分协议（Trojan/Hysteria2/TUIC）的 TLS 是隐含的，链接通常不带 security 参数
+    if implicit and not raw_mode:
+        mode = "tls"
     else:
-        decoded = _decode_base64(username, line_number, "SS 认证信息")
-        try:
-            credentials = decoded.decode("utf-8")
-        except UnicodeDecodeError:
-            raise ConversionError(f"第 {line_number} 行：SS 认证信息不是有效文本") from None
+        mode = (raw_mode or "").strip().lower()
+    if mode not in TLS_MODES:
+        raise ConversionError(f"第 {line_number} 行：不支持的 TLS 类型")
+    reality = mode == "reality"
+    enabled = mode in {"tls", "xtls", "reality"}
+    if required and not enabled:
+        raise ConversionError(f"第 {line_number} 行：该协议必须启用 TLS")
+    if not enabled:
+        return None
+
+    tls: dict = {"enabled": True}
+    server_name = _query_value(params, "sni", "peer")
+    if server_name:
+        tls["server_name"] = server_name
+    if _query_bool(params, line_number, "insecure", "allowInsecure", "skip-cert-verify"):
+        tls["insecure"] = True
+
+    alpn = _query_value(params, "alpn")
+    if alpn:
+        tls["alpn"] = [item for item in (part.strip() for part in alpn.split(",")) if item]
+    elif default_alpn:
+        tls["alpn"] = list(default_alpn)
+
+    fingerprint = _query_value(params, "fp")
+    if reality:
+        public_key = _query_value(params, "pbk", "publicKey")
+        if not public_key:
+            raise ConversionError(f"第 {line_number} 行：Reality 配置缺少公钥")
+        tls["reality"] = {"enabled": True, "public_key": public_key}
+        short_id = _query_value(params, "sid", "shortId")
+        if short_id:
+            tls["reality"]["short_id"] = short_id
+    if fingerprint or reality:
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint or "chrome"}
+    return tls
+
+
+def _build_transport(params: dict[str, str], line_number: int) -> dict | None:
+    raw_type = _query_value(params, "type", "net") or "tcp"
+    transport_type = TRANSPORT_ALIASES.get(raw_type.strip().lower(), raw_type.strip().lower())
+    if transport_type == "tcp":
+        return None
+
+    host = _query_value(params, "host")
+    path = _query_value(params, "path")
+    if transport_type == "ws":
+        transport: dict = {"type": "ws"}
+        transport["path"] = path or "/"
+        if host:
+            transport["headers"] = {"Host": host}
+        return transport
+    if transport_type == "httpupgrade":
+        transport = {"type": "httpupgrade"}
+        if host:
+            transport["host"] = host
+        transport["path"] = path or "/"
+        return transport
+    if transport_type == "grpc":
+        transport = {"type": "grpc"}
+        service_name = _query_value(params, "serviceName", "servicename")
+        if service_name:
+            transport["service_name"] = service_name
+        return transport
+    if transport_type == "http":
+        transport = {"type": "http"}
+        if host:
+            transport["host"] = [item for item in (part.strip() for part in host.split(",")) if item]
+        transport["path"] = path or "/"
+        return transport
+    if transport_type == "quic":
+        return {"type": "quic"}
+    raise ConversionError(f"第 {line_number} 行：不支持的传输类型")
+
+
+def _apply_packet_encoding(node: dict, params: dict[str, str], line_number: int) -> None:
+    encoding = (_query_value(params, "packetEncoding", "packet_encoding") or "").strip().lower()
+    if encoding not in PACKET_ENCODINGS:
+        raise ConversionError(f"第 {line_number} 行：不支持的数据包编码")
+    if encoding:
+        node["packet_encoding"] = encoding
+
+
+def _parse_shadowsocks(uri: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, "ss", line_number)
+    params = _query_params(parsed, line_number)
+
+    username = parsed.username
+    if username is None:
+        raise ConversionError(f"第 {line_number} 行：SS URI 缺少认证信息")
+    if parsed.password is not None:
+        method = unquote(username)
+        secret = unquote(parsed.password)
+    else:
+        credentials = _decode_base64_text(username, line_number, "SS 认证信息")
         method, separator, secret = credentials.partition(":")
         if not separator:
             raise ConversionError(f"第 {line_number} 行：SS 认证信息缺少加密方法或密码")
 
     if not method or not secret:
         raise ConversionError(f"第 {line_number} 行：SS 加密方法或密码不能为空")
-    server_port = _port(port, line_number)
-    tag = _tag(unquote(parsed.fragment), f"shadowsocks-{host}:{server_port}", line_number)
-    return {
+    node = {
         "type": "shadowsocks",
-        "tag": tag,
+        "tag": _tag(unquote(parsed.fragment), f"shadowsocks-{host}:{server_port}", line_number),
         "server": host,
         "server_port": server_port,
         "method": method,
         "password": secret,
     }
+    plugin = _query_value(params, "plugin")
+    if plugin:
+        name, _, options = plugin.partition(";")
+        name = name.strip()
+        if not name:
+            raise ConversionError(f"第 {line_number} 行：字段 plugin 不能为空")
+        node["plugin"] = name
+        if options.strip():
+            node["plugin_opts"] = options.strip()
+    return node
+
+
+def _parse_shadowsocksr(uri: str, line_number: int) -> dict:
+    payload = _decode_base64_text(uri[len("ssr://") :], line_number, "SSR 配置")
+    stripped = "".join(payload.split())
+    body, separator, raw_query = stripped.partition("/?")
+    if not separator and "?" in stripped:
+        body, _, raw_query = stripped.partition("?")
+
+    fields = body.rsplit(":", 5)
+    if len(fields) != 6:
+        raise ConversionError(f"第 {line_number} 行：SSR 配置字段不完整")
+    host, raw_port, protocol, method, obfs, encoded_password = fields
+    if not host:
+        raise ConversionError(f"第 {line_number} 行：SSR 服务器地址不能为空")
+    server_port = _port(raw_port, line_number)
+
+    protocol = protocol.strip()
+    method = method.strip()
+    obfs = obfs.strip()
+    if not protocol or not method or not obfs:
+        raise ConversionError(f"第 {line_number} 行：SSR 加密方法、协议或混淆方式不能为空")
+
+    secret = _decode_base64_text(encoded_password, line_number, "SSR 密码")
+    if not secret:
+        raise ConversionError(f"第 {line_number} 行：SSR 密码不能为空")
+
+    params = dict(parse_qsl(raw_query, keep_blank_values=True))
+    remarks = _query_value(params, "remarks")
+    if remarks:
+        tag = _tag(_decode_base64_text(remarks, line_number, "SSR 备注"), f"shadowsocksr-{host}:{server_port}", line_number)
+    else:
+        tag = _tag(None, f"shadowsocksr-{host}:{server_port}", line_number)
+
+    node = {
+        "type": "shadowsocksr",
+        "tag": tag,
+        "server": host,
+        "server_port": server_port,
+        "method": method,
+        "password": secret,
+        "protocol": protocol,
+        "obfs": obfs,
+    }
+    protocol_param = _query_value(params, "protoparam")
+    if protocol_param:
+        node["protocol_param"] = _decode_base64_text(protocol_param, line_number, "SSR 协议参数")
+    obfs_param = _query_value(params, "obfsparam")
+    if obfs_param:
+        node["obfs_param"] = _decode_base64_text(obfs_param, line_number, "SSR 混淆参数")
+    return node
 
 
 def _parse_vmess(uri: str, line_number: int) -> dict:
@@ -214,23 +436,245 @@ def _parse_vmess(uri: str, line_number: int) -> dict:
     return node
 
 
-def parse_proxy_list(text: str) -> list[dict]:
-    nodes = []
-    tags = set()
+def _parse_vless(uri: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, "vless", line_number)
+    params = _query_params(parsed, line_number)
+    client_id, _ = _credentials(parsed, line_number, "VLESS")
+    try:
+        uuid.UUID(client_id)
+    except (ValueError, AttributeError):
+        raise ConversionError(f"第 {line_number} 行：VLESS 用户 ID 不是有效的 UUID") from None
+
+    encryption = (_query_value(params, "encryption") or "none").strip().lower()
+    if encryption not in {"", "none"}:
+        raise ConversionError(f"第 {line_number} 行：不支持的 VLESS 加密方式")
+
+    flow = (_query_value(params, "flow") or "").strip().lower()
+    if flow not in VLESS_FLOWS:
+        raise ConversionError(f"第 {line_number} 行：不支持的 VLESS flow")
+
+    node = {
+        "type": "vless",
+        "tag": _tag(unquote(parsed.fragment), f"vless-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+        "uuid": client_id,
+    }
+    tls = _build_tls(params, line_number, required=bool(flow))
+    if tls:
+        node["tls"] = tls
+    if flow:
+        node["flow"] = flow
+    transport = _build_transport(params, line_number)
+    if transport:
+        node["transport"] = transport
+    _apply_packet_encoding(node, params, line_number)
+    return node
+
+
+def _parse_trojan(uri: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, "trojan", line_number)
+    params = _query_params(parsed, line_number)
+    secret, extra = _credentials(parsed, line_number, "Trojan")
+    password = secret if extra is None else f"{secret}:{extra}"
+
+    node = {
+        "type": "trojan",
+        "tag": _tag(unquote(parsed.fragment), f"trojan-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+        "password": password,
+        "tls": _build_tls(params, line_number, required=True, implicit=True),
+    }
+    transport = _build_transport(params, line_number)
+    if transport:
+        node["transport"] = transport
+    return node
+
+
+def _parse_hysteria2(uri: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, "hysteria2", line_number)
+    params = _query_params(parsed, line_number)
+
+    username = parsed.username
+    if parsed.password is None:
+        password = unquote(username) if username else _query_value(params, "password")
+    else:
+        password = f"{unquote(username)}:{unquote(parsed.password)}"
+    if not password:
+        raise ConversionError(f"第 {line_number} 行：Hysteria2 URI 缺少密码")
+
+    node = {
+        "type": "hysteria2",
+        "tag": _tag(unquote(parsed.fragment), f"hysteria2-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+        "password": password,
+        "tls": _build_tls(params, line_number, required=True, implicit=True),
+    }
+
+    for field, names in (("up_mbps", ("upmbps", "up")), ("down_mbps", ("downmbps", "down"))):
+        raw_bandwidth = _query_value(params, *names)
+        if raw_bandwidth:
+            node[field] = _integer(raw_bandwidth, line_number, names[0], 1)
+    if _query_bool(params, line_number, "fastopen"):
+        node["tcp_fast_open"] = True
+
+    obfs_type = (_query_value(params, "obfs") or "").strip().lower()
+    if obfs_type and obfs_type != "none":
+        if obfs_type != "salamander":
+            raise ConversionError(f"第 {line_number} 行：不支持的 Hysteria2 混淆方式")
+        obfs_password = _query_value(params, "obfs-password", "obfspassword")
+        if not obfs_password:
+            raise ConversionError(f"第 {line_number} 行：Hysteria2 混淆缺少密码")
+        node["obfs"] = {"type": "salamander", "password": obfs_password}
+    return node
+
+
+def _parse_tuic(uri: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, "tuic", line_number)
+    params = _query_params(parsed, line_number)
+    client_id, password = _credentials(parsed, line_number, "TUIC")
+    if password is None:
+        raise ConversionError(f"第 {line_number} 行：TUIC URI 缺少密码")
+    try:
+        uuid.UUID(client_id)
+    except (ValueError, AttributeError):
+        raise ConversionError(f"第 {line_number} 行：TUIC 用户 ID 不是有效的 UUID") from None
+
+    node = {
+        "type": "tuic",
+        "tag": _tag(unquote(parsed.fragment), f"tuic-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+        "uuid": client_id,
+        "password": password,
+        "tls": _build_tls(params, line_number, required=True, implicit=True, default_alpn=["h3"]),
+    }
+
+    congestion = (_query_value(params, "congestion_control", "congestion") or "").strip().lower()
+    if congestion:
+        if congestion not in CONGESTION_CONTROLS:
+            raise ConversionError(f"第 {line_number} 行：不支持的拥塞控制算法")
+        node["congestion_control"] = congestion
+    relay_mode = (_query_value(params, "udp_relay_mode", "udp-relay-mode") or "").strip().lower()
+    if relay_mode:
+        if relay_mode not in UDP_RELAY_MODES:
+            raise ConversionError(f"第 {line_number} 行：不支持的 UDP 转发模式")
+        node["udp_relay_mode"] = relay_mode
+    return node
+
+
+def _parse_socks(uri: str, scheme: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, scheme, line_number)
+    node = {
+        "type": "socks",
+        "tag": _tag(unquote(parsed.fragment), f"socks-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+        "version": "5",
+    }
+    username = parsed.username
+    if username:
+        node["username"] = unquote(username)
+        if parsed.password is not None:
+            node["password"] = unquote(parsed.password)
+    return node
+
+
+def _parse_http(uri: str, scheme: str, line_number: int) -> dict:
+    parsed, host, server_port = _split_link(uri, scheme, line_number)
+    node = {
+        "type": "http",
+        "tag": _tag(unquote(parsed.fragment), f"http-{host}:{server_port}", line_number),
+        "server": host,
+        "server_port": server_port,
+    }
+    username = parsed.username
+    if username:
+        node["username"] = unquote(username)
+        node["password"] = unquote(parsed.password) if parsed.password is not None else ""
+    return node
+
+
+PROTOCOL_PARSERS = {
+    "ss": _parse_shadowsocks,
+    "ssr": _parse_shadowsocksr,
+    "vmess": _parse_vmess,
+    "vless": _parse_vless,
+    "trojan": _parse_trojan,
+    "hysteria2": _parse_hysteria2,
+    "hy2": _parse_hysteria2,
+    "tuic": _parse_tuic,
+    "socks": lambda uri, number: _parse_socks(uri, "socks", number),
+    "socks5": lambda uri, number: _parse_socks(uri, "socks5", number),
+    "http": lambda uri, number: _parse_http(uri, "http", number),
+    "https": lambda uri, number: _parse_http(uri, "https", number),
+}
+
+
+def _iter_entries(text: str):
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        numbered_line = re.match(r"^\d+\s+((?:ss|vmess)://\S+)$", line, re.IGNORECASE)
+        numbered_line = re.match(r"^\d+\s+([A-Za-z][A-Za-z0-9+.\-]*://\S+)$", line)
         if numbered_line:
             line = numbered_line.group(1)
-        lowered = line.lower()
-        if lowered.startswith("ss://"):
-            node = _parse_shadowsocks(line, line_number)
-        elif lowered.startswith("vmess://"):
-            node = _parse_vmess(line, line_number)
+        yield line_number, line
+
+
+def _looks_like_proxy_list(text: str) -> bool:
+    for _, line in _iter_entries(text):
+        scheme, separator, _ = line.partition("://")
+        if separator and scheme.lower() in PROTOCOL_PARSERS:
+            return True
+    return False
+
+
+def _looks_like_subscription(text: str) -> bool:
+    compact = "".join(text.split())
+    if len(compact) < SUBSCRIPTION_MIN_LENGTH:
+        return False
+    if not BASE64_PATTERN.fullmatch(compact):
+        return False
+    try:
+        decoded = _decode_subscription(compact)
+    except ConversionError:
+        return False
+    return _looks_like_proxy_list(decoded)
+
+
+def _decode_subscription(text: str) -> str:
+    encoded = text.encode("ascii")
+    encoded += b"=" * (-len(encoded) % 4)
+    try:
+        payload = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        raise ConversionError("订阅内容不是有效的 Base64") from None
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ConversionError("订阅内容解码后不是有效文本") from None
+
+
+def parse_proxy_list(text: str) -> list[dict]:
+    if not _looks_like_proxy_list(text):
+        if _looks_like_subscription(text):
+            text = _decode_subscription("".join(text.split()))
         else:
-            raise ConversionError(f"第 {line_number} 行：仅支持 SS 和 VMess URI")
+            raise ConversionError(f"内容既不是代理列表也不是 Base64 订阅；仅支持 {SUPPORTED_SUMMARY} URI")
+
+    nodes = []
+    tags = set()
+    for line_number, line in _iter_entries(text):
+        scheme, separator, _ = line.partition("://")
+        protocol = scheme.lower() if separator else ""
+        parser = PROTOCOL_PARSERS.get(protocol)
+        if parser is None:
+            actual = f"检测到 {protocol}://" if protocol else "该行不是 xx:// 形式的分享链接"
+            raise ConversionError(f"第 {line_number} 行：{actual}，仅支持 {SUPPORTED_SUMMARY} URI")
+        node = parser(line, line_number)
         if node["tag"] in tags:
             raise ConversionError(f"第 {line_number} 行：节点 tag 重复")
         tags.add(node["tag"])
@@ -346,12 +790,36 @@ def write_output(path: Path, content: str, *, force: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="根据 SS/VMess 代理列表更新完整 sing-box JSON 配置")
-    parser.add_argument("-i", "--input", "--source", dest="source", type=Path, default=DEFAULT_SOURCE, help="代理 URI 列表")
+    parser = argparse.ArgumentParser(
+        description=f"根据 {SUPPORTED_SUMMARY} 代理列表或 Base64 订阅更新完整 sing-box JSON 配置",
+    )
+    parser.add_argument("-i", "--input", "--source", dest="source", type=Path, default=DEFAULT_SOURCE, help="代理 URI 列表，或整份 Base64 订阅")
     parser.add_argument("--template", type=Path, required=True, help="完整 sing-box JSON 配置模板，需包含两个目标选择器")
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT, help="生成的完整配置文件")
     parser.add_argument("--force", action="store_true", help="允许覆盖已存在的输出文件")
+    parser.add_argument(
+        "--exclude-tag",
+        action="append",
+        default=[],
+        metavar="正则",
+        help="排除 tag 匹配该正则的节点（如订阅商注入的流量/到期信息节点），可重复",
+    )
     return parser
+
+
+def _select_nodes(nodes: list[dict], patterns: list[str], parser: argparse.ArgumentParser) -> list[dict]:
+    if not patterns:
+        return nodes
+    compiled = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as error:
+            parser.error(f"--exclude-tag 正则无效：{error}")
+    kept = [node for node in nodes if not any(item.search(node["tag"]) for item in compiled)]
+    if not kept:
+        parser.error("按 --exclude-tag 排除后没有剩余节点")
+    return kept
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -378,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         nodes = parse_proxy_list(source_text)
+        nodes = _select_nodes(nodes, args.exclude_tag, parser)
         config = update_template(template, nodes)
         serialized = json.dumps(config, ensure_ascii=False, indent=2) + "\n"
         write_output(output_path, serialized, force=args.force)
